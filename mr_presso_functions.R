@@ -20,7 +20,7 @@ orig_column_list <- list(
   pval_columns = unique(c("P", "P-VALUE", "P.VALUE", "PVALUE", "P_VALUE", "P VALUE")),
   eaf_columns = unique(c('EAF', 'FREQ1', 'EFFECT ALLELE FREQUENCY (EAF)')),
   se_columns = unique(c('STDERR', 'SE', 'STANDARD_ERROR')), 
-  samplesize_columns = unique(c('N', 'SAMPLESIZE', 'EFFECTIVE_N', 'N_COMPLETE_SAMPLES', 'SAMPLE SIZE')),
+  samplesize_columns = unique(c('N', 'SAMPLESIZE', 'EFFECTIVE_N', 'N_COMPLETE_SAMPLES', 'SAMPLE SIZE', 'WEIGHT')),
   maf = 'MAF' # To prevent duplicate columns names when we merge
 )
 
@@ -183,8 +183,7 @@ run_mr_presso_analyses <- function(sig_ldsc_results, exposure_column, outcome_co
         if(nrow(outcome) > 0){
         harmonized_mr_data <- harmonise_data(
             exposure_dat = exposure,
-            outcome_dat = outcome
-        )
+            outcome_dat = outcome )
         }
         
         cat("\nRunning analysis...\n")
@@ -327,3 +326,186 @@ run_cause_analyses  <- function(sig_ldsc_results, output_directory, r2_thresh = 
     fwrite(results1, paste0(output_directory, 'ELPD/EUR/cause_ELPD_Results_ALL.txt'))
     fwrite(results2, paste0(output_directory, 'medianInterval/EUR/cause_medianInterval_Results_ALL.txt'))
 }
+
+# Generalized function to streamline MR analyses
+
+# sig_ldsc_results = ldsc_results_sig; exposure_column = 'sudPhen'; outcome_column = 'agingPhen'; analysis_type = 'IVW'
+run_mr_analysis <- function(sig_ldsc_results, exposure_column, outcome_column, analysis_type) {
+    loo=T
+    # Define result columns based on the analysis type
+    results_colnames <- switch(
+        analysis_type,
+        "IVW" = c('Exposure_Name', 'Outcome_Name', 'MR_Estimate', 'SE', 'P', 'SNP', 'Q', 'Q_df', 'Q_pval'),
+        "Egger" = c('Exposure_Name', 'Outcome_Name', 'Beta', 'SE', 'P', 'N_SNP', 'Beta_i', 'SE_i', 'P_i', 'Q', 'Q_df', 'Q_pval', 'R_sq'),
+        "MedianWeighted" = c('Exposure_Name', 'Outcome_Name', 'Beta', 'SE', 'P'),
+        stop("Invalid analysis type specified.")
+    )
+    
+    # Initialize an empty results dataframe
+    results <- data.frame(matrix(NA, nrow = nrow(sig_ldsc_results), ncol = length(results_colnames)))
+    colnames(results) <- results_colnames
+
+    # Loop through each row of significant LDSC results
+    for (i in 1:nrow(sig_ldsc_results)) {
+        
+        # Extract exposure and outcome pair
+        pair_temp <- sig_ldsc_results[i, c(exposure_column, outcome_column)]
+        exposure_name <- as.character(pair_temp[1])
+        outcome_name <- as.character(pair_temp[2])
+        
+        # Store exposure and outcome names in results
+        results[i, 'Exposure_Name'] <- exposure_name
+        results[i, 'Outcome_Name'] <- outcome_name
+
+        # Print update for user
+        cat("\n---------------------------------------------------------------------------")
+        cat(sprintf("\nConducting %s MR for: %s --➜ %s\n", analysis_type, exposure_name, outcome_name))
+        cat(sprintf("(Analysis %d of %d)\n", i, nrow(sig_ldsc_results)))
+        cat("----------------------------------------------------------------------------\n")
+
+        # Load exposure and outcome datasets
+        exposure <- data.frame(get(paste0(exposure_name, '_mrpresso_exposure')))
+        outcome <- data.frame(get(paste0(outcome_name, '_mrpresso_outcome')))
+
+        exposure$SD.exposure <- estimate_trait_sd(
+            exposure$beta.exposure, 
+            exposure$se.exposure, 
+            exposure$samplesize.exposure, 
+            exposure$pval.exposure)
+        
+        outcome$SD.outcome <- estimate_trait_sd(
+            outcome$beta.outcome, 
+            outcome$se.outcome, 
+            outcome$samplesize.outcome, 
+            outcome$pval.outcome)
+
+        if(nrow(outcome) > 0 & nrow(exposure) > 0){
+            harmonized_mr_data <- harmonise_data(
+                exposure_dat = exposure,
+                outcome_dat = outcome
+            )
+        }else(harmonized_mr_data <- data.frame())
+
+        # Run stuff (but only if there are SNPs to run stuff on):
+        if (nrow(harmonized_mr_data) > 0) {
+            # Run the specified MR analysis
+            if (analysis_type == "IVW") {
+                if (loo==T){
+                    # Leave-One_Out:
+                    ivw_results = mr_leaveoneout(harmonized_mr_data, parameters = default_parameters(), method = mr_ivw_mre)
+                }else{
+                    ivw_results <- data.frame(mr_ivw_mre(
+                    harmonized_mr_data$beta.exposure,
+                    harmonized_mr_data$beta.outcome, 
+                    harmonized_mr_data$se.exposure, 
+                    harmonized_mr_data$se.outcome,
+                    parameters = default_parameters()))
+                }
+                # Inverse Variance Weighted MR with multiplicative random effects:
+
+                results[i, ] <- cbind(exposure_name, outcome_name, ivw_results)
+
+            } else if (analysis_type == "Egger") {
+                if (loo==T){
+                    # Leave-One_Out:
+                    ivw_results = mr_leaveoneout(harmonized_mr_data, parameters = default_parameters(), method = mr_ivw_mre)
+                }else{
+                # MR-Egger Regression
+                egger_results_temp <- mr_egger_regression(
+                    harmonized_mr_data$beta.exposure,
+                    harmonized_mr_data$beta.outcome, 
+                    harmonized_mr_data$se.exposure, 
+                    harmonized_mr_data$se.outcome,
+                    parameters = default_parametersg())
+                }
+                if (!is.na(egger_results_temp$b)) {
+                    egger_results <- data.frame(
+                        b = egger_results_temp$b,
+                        se = egger_results_temp$se,
+                        pval = egger_results_temp$pval,
+                        nsnp = egger_results_temp$nsnp,
+                        b_i = egger_results_temp$b_i,
+                        se_i = egger_results_temp$se_i,
+                        pval_i = egger_results_temp$pval_i,
+                        Q = egger_results_temp$Q,
+                        Q_df = egger_results_temp$Q_df,
+                        Q_pval = egger_results_temp$Q_pval,
+                        r_squared = egger_results_temp$mod$r.squared
+                    )
+                    results[i, ] <- cbind(exposure_name, outcome_name, egger_results)
+                } else {
+                    cat("Not enough instruments. Moving to next trait.\n")
+                }
+            } else if (analysis_type == "MedianWeighted") {
+                # Median-Weighted MR
+                med_weighted_results_temp <- mr_weighted_median(
+                    harmonized_mr_data$beta.exposure,
+                    harmonized_mr_data$beta.outcome, 
+                    harmonized_mr_data$se.exposure, 
+                    harmonized_mr_data$se.outcome,
+                    parameters = default_parameters()
+                )
+                if (!is.na(med_weighted_results_temp$b)) {
+                    med_weighted_results <- data.frame(
+                        Beta = med_weighted_results_temp$b,
+                        SE = med_weighted_results_temp$se,
+                        P = med_weighted_results_temp$pval
+                    )
+                    results[i, ] <- cbind(exposure_name, outcome_name, med_weighted_results)
+                } else {
+                    cat("Not enough instruments. Moving to next trait.\n")
+                }
+            }
+            cat("...Done.\n")
+        } else {
+            cat("Not enough instruments. Moving to next trait.\n")
+        }
+    }
+    return(results)
+}
+
+# Define specific methods
+run_ivw_mr <- function(sig_ldsc_results, exposure_column, outcome_column) {
+    result_cols <- c('Exposure_Name', 'Outcome_Name', 'MR_Estimate', 'SE', 'P', 'SNP', 'Q', 'Q_df', 'Q_pval')
+    run_mr_analysis(sig_ldsc_results, exposure_column, outcome_column, "IVW MR", mr_ivw, result_cols)
+}
+
+run_mr_egger <- function(sig_ldsc_results, exposure_column, outcome_column) {
+    result_cols <- c('Exposure_Name', 'Outcome_Name', 'Beta', 'SE', 'P', 'N_SNP', 'Beta_i', 'SE_i', 'P_i', 'Q', 'Q_df', 'Q_pval', 'R_sq')
+
+    extra_processing <- function(results_temp) {
+        data.frame(
+            Beta = results_temp$b,
+            SE = results_temp$se,
+            P = results_temp$pval,
+            N_SNP = results_temp$nsnp,
+            Beta_i = results_temp$b_i,
+            SE_i = results_temp$se_i,
+            P_i = results_temp$pval_i,
+            Q = results_temp$Q,
+            Q_df = results_temp$Q_df,
+            Q_pval = results_temp$Q_pval,
+            R_sq = results_temp$mod$r.squared
+        )
+    }
+    run_mr_analysis(sig_ldsc_results, exposure_column, outcome_column, "MR-Egger", mr_egger_regression, result_cols, extra_processing)
+}
+
+run_medweighted_mr <- function(sig_ldsc_results, exposure_column, outcome_column) {
+    result_cols <- c('Exposure_Name', 'Outcome_Name', 'Beta', 'SE', 'P')
+
+    extra_processing <- function(results_temp) {
+        data.frame(
+            Beta = results_temp$b,
+            SE = results_temp$se,
+            P = results_temp$pval
+        )
+    }
+    run_mr_analysis(sig_ldsc_results, exposure_column, outcome_column, "Median-Weighted MR", mr_penalised_weighted_median, result_cols, extra_processing)
+}
+
+
+loo_1 = mr_leaveoneout(harmonized_mr_data, parameters = default_parameters(), method = mr_ivw_mre)
+loo_2 = mr_leaveoneout(harmonized_mr_data, parameters = default_parameters(), method = mr_egger_regression)
+loo_3 = mr_leaveoneout(harmonized_mr_data, parameters = default_parameters(), method = mr_weighted_median)
+
